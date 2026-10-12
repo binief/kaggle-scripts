@@ -82,6 +82,28 @@ def kill_port(port):
         time.sleep(0.3)
 
 
+def http_probe(port, path="/", timeout=3):
+    """GET 127.0.0.1:`port``path` -> (status, note); status 0 = nothing answered.
+
+    Lets the gateway tell "the backend does not serve this" apart from "the
+    gateway is broken" -- e.g. a llama-server started with --no-ui answers 404
+    for `/` all by itself, and no amount of nginx config changes that.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.status, (r.headers.get("Content-Type") or "").split(";")[0]
+    except urllib.error.HTTPError as e:
+        try:
+            note = (e.read(200) or b"").decode(errors="replace").strip().replace("\n", " ")
+        except Exception:
+            note = ""
+        return e.code, note
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+
 def tail(path, n=40):
     print(sh(f"tail -n {n} {path}", capture_output=True, text=True).stdout)
 

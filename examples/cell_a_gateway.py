@@ -18,3 +18,5 @@ ck.nginx(port=8890, llama=8080, token="auto", services=MCPS)
 
 # open the WebUI at  https://<tunnel>/          (paste the printed /v1 token in
 # Settings -> General -> API Key)   |   MCP clients use  https://<tunnel>/mcp
+# OpenAI clients: base_url = https://<tunnel>/v1  (llama's /v1 routes pass through
+# unchanged -- there is nothing at exactly /v1, that 404 is llama's own)

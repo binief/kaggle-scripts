@@ -11,7 +11,8 @@ import os
 import re
 import time
 
-from .util import (kill_port, port_open, regex_escape, resolve_token, sh, spawn, tail, wait_port)
+from .util import (http_probe, kill_port, port_open, regex_escape, resolve_token, sh, spawn,
+                   tail, wait_port)
 
 DEFAULT_DIR = "/kaggle/working/mcp_gateway"
 NGINX_CANDIDATES = ["nginx", "/usr/sbin/nginx", "/usr/local/sbin/nginx",
@@ -32,7 +33,13 @@ def svc(route, port, name=None, routes=None, kind="http", mode="prefix",
 
 
 def http(route, port, **kw):
-    """Prefix mount: /v1/chat/x -> backend /chat/x (bare /v1 -> backend /)."""
+    """Prefix mount: /svc/echo/x -> backend /x (bare /svc/echo -> backend /).
+
+    Pass `strip_prefix=False` to keep the mount point in the path the backend
+    sees (`/v1/chat/completions` -> backend `/v1/chat/completions`). Use it
+    whenever the backend already serves the prefixed routes -- which is the
+    case for llama-server, see `llama()`.
+    """
     return svc(route, port, **kw)
 
 
@@ -54,13 +61,25 @@ def webui(port, name="llama_ui", **kw):
 
 
 def llama(port=8080, token="auto", public_paths=("/health", "/props", "/v1/models")):
-    """The three entries llama-server needs: WebUI catch-all + /v1 + ops routes."""
+    """The three entries llama-server needs: WebUI catch-all + /v1 + ops routes.
+
+    `/v1` is mounted **identity** (strip_prefix=False) on purpose: llama-server
+    already serves its OpenAI-compatible API under `/v1`, so the prefix has to
+    survive the trip. Stripping it puts `/v1/stream`, `/v1/streams/lookup`,
+    `/v1/chat/completions/control`, `/v1/messages`, `/v1/messages/count_tokens`
+    and `/v1/systemone` -- routes llama only has under `/v1` -- onto paths that
+    do not exist (404, and `/v1/stream` is what the WebUI reads its tokens from,
+    so the UI dies with them), and it silently drops `/v1/completions` and
+    `/v1/embeddings` onto llama's *legacy* non-OpenAI handlers, which answer
+    with a different schema.
+    """
     def _pub(*want):
         return [p for p in want if p in public_paths]
 
     return [
         webui(port),
-        http("/v1", port, name="llama_api", token=token, public_paths=_pub("/v1/models")),
+        http("/v1", port, name="llama_api", token=token, strip_prefix=False,
+             public_paths=_pub("/v1/models")),
         exact(["/health", "/props", "/metrics", "/slots", "/tokenize", "/detokenize"], port,
               name="llama_ops", token=token, public_paths=_pub("/health", "/props")),
     ]
@@ -196,10 +215,13 @@ proxy_send_timeout 86400s;
                     f'        "~*^Bearer[[:space:]]+{regex_escape(e["token"])}$" 1;\n'
                     f"    }}")
         if e["public_paths"]:
+            # matched against $request_uri (raw, pre-rewrite) so it stays put no
+            # matter what the location does to the path; a trailing slash and a
+            # query string are tolerated -- `/v1/models?meta=1` is still public
             pub = "|".join(regex_escape(p) for p in e["public_paths"])
             maps.append(f"    map $request_uri ${e['alias']}_public {{\n"
                         f"        default 0;\n"
-                        f"        ~*^({pub})$ 1;\n"
+                        f"        ~*^({pub})/?(\\?.*)?$ 1;\n"
                         f"    }}\n"
                         f"    map \"${e['alias']}_ok${e['alias']}_public\" ${e['alias']}_deny {{\n"
                         f"        default 0;\n"
@@ -257,15 +279,21 @@ proxy_send_timeout 86400s;
         }}""".rstrip())
             else:
                 root = "" if e["root"] == "/" else e["root"]
+                # the bare mount point, no path after it: a stripping mount hands
+                # it to the backend root, an identity mount leaves the URI alone
+                # (`/v1` -> `/v1`), so `/v1` never silently turns into the WebUI
+                bare = (f"http://{e['alias']}{root}/" if e["strip_prefix"]
+                        else f"http://{e['alias']}")
+                where = f"{root}/" if e["strip_prefix"] else route
                 locations.append(f"""
-        # -- {e['name']} : {route}  ->  127.0.0.1:{e['port']}{root or '/'}   [prefix]
+        # -- {e['name']} : {route}  ->  127.0.0.1:{e['port']}{where}   [prefix]
         location = {route} {{
-{g}        proxy_pass http://{e['alias']}{root}/;
+{g}        proxy_pass {bare};
         include {inc_file};
         }}""".rstrip())
                 locations.append(f"""
         location = {route}/ {{
-{g}        proxy_pass http://{e['alias']}{root}/;
+{g}        proxy_pass {bare};
         include {inc_file};
         }}""".rstrip())
                 if e["strip_prefix"]:
@@ -277,6 +305,7 @@ proxy_send_timeout 86400s;
         }}""".rstrip())
                 else:
                     locations.append(f"""
+        # identity: the prefix travels with the request, no rewrite
         location ~ ^{rx}(/.*)?$ {{
 {g}        proxy_pass http://{e['alias']};
         include {inc_file};
@@ -429,9 +458,41 @@ def nginx(port=8890, services=(), llama=None, token="auto", sse_compat=None,  # 
         for name, tok in state["tokens"].items():
             print(f"  token [{name}]: Bearer {tok}")
         if catch:
-            print(f"  WebUI:  http://127.0.0.1:{port}/   ->  https://<tunnel>/")
+            code, note = origin_note(catch[0])
+            print(f"  WebUI:  http://127.0.0.1:{port}/   ->  https://<tunnel>/   "
+                  f"[origin :{catch[0]['port']}/ {code}{note}]")
+        api = next((e for e in entries if e["name"] == "llama_api"), None)
+        if api:
+            print("  API:    base_url https://<tunnel>/v1  -- llama's own /v1 routes, path "
+                  "for path\n     (llama has no handler at exactly /v1: that 404 is its own, "
+                  "not the gateway's)")
+            if api["token"] and catch:
+                print("  !! the UI *page* is open, its API calls are not: paste the token into "
+                      f"the UI\n     (Settings -> General -> API Key, value: "
+                      f"{api['token'][:12]}...) or chat + stream 401;\n"
+                      "     token=None on llama= opens everything instead.")
         print(f"  map:    http://127.0.0.1:{port}/_gateway   |   ngrok http {port}\n{'=' * 68}")
     return state
+
+
+# what the backend itself says about `/`, phrased as the action it implies
+ORIGIN_HINTS = {
+    404: "the backend serves no UI at / (--no-ui, a build without the embedded UI, or an "
+         "--api-prefix); nginx cannot invent it",
+    401: "the backend has its own --api-key; pick one gate",
+    403: "the backend refused the request (CORS/origin); try --cors-origins '*'",
+    503: "still loading the model, retry in a moment",
+    0:   "nothing listening on that port: your llama-server cell did not start",
+}
+
+
+def origin_note(entry):
+    """(code, note) for GET 127.0.0.1:<entry port>/ -- the truth about the WebUI."""
+    code, body = http_probe(entry["port"], "/")
+    if code in (200, 304):
+        return code, f" {body}" if body else ""
+    hint = ORIGIN_HINTS.get(code, "")
+    return code, ((" -- " + hint) if hint else "") + (f" | {body[:80]}" if body else "")
 
 
 llama_ = llama          # internal alias (kept out of the public tables)
@@ -451,12 +512,20 @@ def status(directory=DEFAULT_DIR):
     if not st:
         print("cellkit: no state yet -- run ck.nginx(...) first")
         return {}
-    print(f"gateway on {st['public_port']}  "
-          + ("(nginx up)" if port_open(st["public_port"]) else "(nginx DOWN)"))
+    public = st["public_port"]
+    print(f"gateway on {public}  "
+          + ("(nginx up)" if port_open(public) else "(nginx DOWN)"))
     for e in st.get("services", []):
         live = "up  " if port_open(e["port"]) else "down"
         print(f"  {','.join(e['routes']):<24}-> 127.0.0.1:{e['port']:<6}{live}"
               f"{' [auth]' if e['token'] else ''}  {e['name']}")
+        if live == "up  " and "/" in e["routes"]:      # catch-all == the WebUI
+            code, note = origin_note(e)
+            if code != 200:
+                print(f"  {'':<24}   !! origin GET / -> {code}{note}")
+    for path in ("/", "/_gateway"):
+        code, note = http_probe(public, path)
+        print(f"  via gateway   GET {path:<10}-> {code} {note}")
     return st
 
 
