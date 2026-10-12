@@ -23,6 +23,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 PUBLIC, LLAMA, M1, M2, M3 = 8890, 8080, 8891, 8892, 8893
+NO_UI = 8099          # second fake llama, started with --no-ui, for the origin probe
 LLAMA_TOKEN, MCP_TOKEN = "test-token-123", "mcpsecret"
 NODE = shutil.which("node") or "/usr/bin/node"
 
@@ -119,7 +120,7 @@ def listeners(port):
 subprocess.run("pkill -9 -f '[m]cp-proxy' || true; pkill -9 -f '[m]ock_upstream' || true; "
                "pkill -9 -f '[f]ake_llama' || true", shell=True)
 time.sleep(0.5)
-for port in (PUBLIC, LLAMA, M1, M2, M3):
+for port in (PUBLIC, LLAMA, M1, M2, M3, NO_UI):
     for pid in listeners(port):
         try:
             os.kill(pid, 9)
@@ -156,55 +157,97 @@ st = ck.nginx(port=PUBLIC, llama=LLAMA, token=LLAMA_TOKEN, services=[*MCPS, *ser
               sse_compat=True)          # -> the first mcp service
 
 print("\n--- routing through the single public port ---")
+FAKE = "llama-server(fake)"
 cases = [
-    # llama surface (WebUI catch-all + /v1 + exact ops routes)
-    ("GET",  "/health",                 None,         200, "llama-server(fake)", "/health", ""),
-    ("GET",  "/v1/models",              None,         200, "llama-server(fake)", "/models", ""),
-    ("POST", "/v1/chat/completions",    None,         401, None, None, None),
-    ("POST", "/v1/chat/completions",    LLAMA_TOKEN,  200, "llama-server(fake)", "/chat/completions", ""),
-    ("GET",  "/metrics",                "wrong",      401, None, None, None),
-    ("GET",  "/props",                  None,         200, "llama-server(fake)", "/props", ""),   # public: WebUI reads it
-    ("GET",  "/metrics",                LLAMA_TOKEN,  200, "llama-server(fake)", "/metrics", ""),
-    # MCP mounts
-    ("POST", "/mcp",                    None,         200, "mcp1", "/mcp", ""),
-    ("GET",  "/mcp",                    None,         200, "mcp1", "/mcp", ""),
-    ("GET",  "/mcp/sse",                None,         200, "mcp1", "/sse", ""),
-    ("GET",  "/mcp/ping",               None,         200, "mcp1", "/ping", ""),
-    ("POST", "/mcp/messages?sessionId=abc", None,     200, "mcp1", "/messages", "sessionId=abc"),
-    ("POST", "/mcp/fs",                 None,         401, None, None, None),
-    ("POST", "/mcp/fs",                 MCP_TOKEN,    200, "mcp2", "/mcp", ""),
-    ("GET",  "/mcp/fs/sse",             MCP_TOKEN,    200, "mcp2", "/sse", ""),
-    ("GET",  "/mcp/fs/ping",            MCP_TOKEN,    200, "mcp2", "/ping", ""),
-    ("POST", "/mcp/fs/messages?sessionId=zz", MCP_TOKEN, 200, "mcp2", "/messages", "sessionId=zz"),
-    # generic http service
-    ("GET",  "/svc/echo/abc?x=1",       None,         200, "echo-svc", "/abc", "x=1"),
-    ("GET",  "/svc/echo/deep/path",     None,         200, "echo-svc", "/deep/path", ""),
-    ("GET",  "/raw/echo/abc",           None,         200, "echo-svc", "/raw/echo/abc", ""),
+    # llama surface (WebUI catch-all + identity-mounted /v1 + exact ops routes).
+    # `/v1/...` has to reach llama with its prefix intact: llama.cpp registers the
+    # OpenAI routes under /v1 (tests/llama_routes.py), so a mount that strips it
+    # 404s on every /v1-only route and lands /v1/completions + /v1/embeddings on
+    # llama's *legacy* handlers, which answer with a different schema.
+    # (method, path, token, status, upstream, path at the backend, query, handler)
+    ("GET",  "/health",                 None,         200, FAKE, "/health", "", "get_health"),
+    ("GET",  "/v1/models",              None,         200, FAKE, "/v1/models", "", "get_models"),
+    ("GET",  "/v1/models?meta=1",       None,         200, FAKE, "/v1/models", "meta=1", "get_models"),
+    ("POST", "/v1/chat/completions",    None,         401, None, None, None, None),
+    ("POST", "/v1/chat/completions",    LLAMA_TOKEN,  200, FAKE, "/v1/chat/completions", "", "post_chat_completions"),
+    ("POST", "/v1/completions",         LLAMA_TOKEN,  200, FAKE, "/v1/completions", "", "post_completions_oai"),
+    ("POST", "/v1/embeddings",          LLAMA_TOKEN,  200, FAKE, "/v1/embeddings", "", "post_embeddings_oai"),
+    # /v1-only routes -- a stripping mount sends these to paths llama never serves
+    ("POST", "/v1/streams/lookup",      LLAMA_TOKEN,  200, FAKE, "/v1/streams/lookup", "", "streams_lookup"),
+    ("POST", "/v1/chat/completions/control", LLAMA_TOKEN, 200, FAKE, "/v1/chat/completions/control", "", "post_control"),
+    ("POST", "/v1/messages",            LLAMA_TOKEN,  200, FAKE, "/v1/messages", "", "post_anthropic_messages"),
+    ("POST", "/v1/messages/count_tokens", LLAMA_TOKEN, 200, FAKE, "/v1/messages/count_tokens", "", "post_anthropic_count_tokens"),
+    ("POST", "/v1/audio/transcriptions", LLAMA_TOKEN, 200, FAKE, "/v1/audio/transcriptions", "", "post_transcriptions_oai"),
+    ("POST", "/v1/systemone",           LLAMA_TOKEN,  200, FAKE, "/v1/systemone", "", "post_systemone"),
+    ("POST", "/v1/responses",           LLAMA_TOKEN,  200, FAKE, "/v1/responses", "", "post_responses_oai"),
+    # the API base is a prefix, not an endpoint: it must not be rewritten to "/"
+    ("GET",  "/v1",                     LLAMA_TOKEN,  404, None, None, None, None),
+    # ops routes, exact, one public pair for the WebUI to poll
+    ("GET",  "/metrics",                "wrong",      401, None, None, None, None),
+    ("GET",  "/props",                  None,         200, FAKE, "/props", "", "get_props"),
+    ("GET",  "/metrics",                LLAMA_TOKEN,  200, FAKE, "/metrics", "", "get_metrics"),
+    ("POST", "/slots/3",                None,         200, FAKE, "/slots/3", "", "post_slot"),   # = /slots does not swallow subpaths
+    # MCP mounts (these two backends stay plain echoes: no route table to honour)
+    ("POST", "/mcp",                    None,         200, "mcp1", "/mcp", "", None),
+    ("GET",  "/mcp",                    None,         200, "mcp1", "/mcp", "", None),
+    ("GET",  "/mcp/sse",                None,         200, "mcp1", "/sse", "", None),
+    ("GET",  "/mcp/ping",               None,         200, "mcp1", "/ping", "", None),
+    ("POST", "/mcp/messages?sessionId=abc", None,     200, "mcp1", "/messages", "sessionId=abc", None),
+    ("POST", "/mcp/fs",                 None,         401, None, None, None, None),
+    ("POST", "/mcp/fs",                 MCP_TOKEN,    200, "mcp2", "/mcp", "", None),
+    ("GET",  "/mcp/fs/sse",             MCP_TOKEN,    200, "mcp2", "/sse", "", None),
+    ("GET",  "/mcp/fs/ping",            MCP_TOKEN,    200, "mcp2", "/ping", "", None),
+    ("POST", "/mcp/fs/messages?sessionId=zz", MCP_TOKEN, 200, "mcp2", "/messages", "sessionId=zz", None),
+    # generic http service: /svc/echo strips, /raw/echo does not
+    ("GET",  "/svc/echo/abc?x=1",       None,         200, "echo-svc", "/abc", "x=1", None),
+    ("GET",  "/svc/echo/deep/path",     None,         200, "echo-svc", "/deep/path", "", None),
+    ("GET",  "/svc/echo",               None,         200, "echo-svc", "/", "", None),
+    ("GET",  "/raw/echo/abc",           None,         200, "echo-svc", "/raw/echo/abc", "", None),
+    ("GET",  "/raw/echo",               None,         200, "echo-svc", "/raw/echo", "", None),
     # legacy SSE compat at the origin
-    ("GET",  "/sse",                    None,         200, "mcp1", "/sse", ""),
-    ("POST", "/messages?sessionId=orig", None,        200, "mcp1", "/messages", "sessionId=orig"),
+    ("GET",  "/sse",                    None,         200, "mcp1", "/sse", "", None),
+    ("POST", "/messages?sessionId=orig", None,        200, "mcp1", "/messages", "sessionId=orig", None),
 ]
-for method, path, token, status, upstream, upath, query in cases:
+for method, path, token, status, upstream, upath, query, handler in cases:
     code, _, body = req(method, path, token)
     label = f"{method} {path}" + (f"  [{token}]" if token else "")
     check(f"{label} -> {status}", code, status)
     if upstream:
         j = jget(body)
-        check(f"{label} -> {upstream}{upath}", (j.get("name"), j.get("path"), j.get("query")),
-              (upstream, upath, query))
+        check(f"{label} -> {upstream}{upath}",
+              (j.get("name"), j.get("path"), j.get("query"), j.get("handler")),
+              (upstream, upath, query, handler))
 
 # the WebUI (catch-all at "/") + everything else still routing correctly
 code, _, body = req("GET", "/")
 check("GET / -> WebUI (catch-all HTML)", (code, "webui-html" in body), (200, True))
-code, _, body = req("GET", "/bundle.js")
-check("GET /bundle.js -> WebUI asset", (code, "bundle.js" in body), (200, True))
+code, _, body = req("GET", "/index.html")
+check("GET /index.html -> WebUI", (code, "webui-html" in body), (200, True))
+code, _, body = req("GET", "/_app/immutable/entry/app.js")
+check("GET /_app/... -> WebUI asset", (code, "app.js" in body), (200, True))
+code, _, body = req("GET", "/build.json")
+check("GET /build.json -> WebUI asset (PWA no-cache list)", (code, "build.json" in body), (200, True))
 check("catch-all doesn't swallow /mcp", jget(req("POST", "/mcp")[2]).get("name"), "mcp1")
 check("catch-all doesn't swallow /mcp/fs", jget(req("POST", "/mcp/fs", MCP_TOKEN)[2]).get("name"), "mcp2")
-check("catch-all doesn't swallow /v1/models", jget(req("GET", "/v1/models")[2]).get("path"), "/models")
+check("catch-all doesn't swallow /v1/models", jget(req("GET", "/v1/models")[2]).get("path"), "/v1/models")
 check("catch-all doesn't swallow /health", jget(req("GET", "/health")[2]).get("status"), "ok")
 check("UI ungated while /v1 gated", (req("GET", "/")[0], req("POST", "/v1/chat/completions")[0]), (200, 401))
-code, _, body = req("GET", "/v1", LLAMA_TOKEN)
-check("GET /v1 (authed) -> backend root (WebUI page)", (code, "webui-html" in body), (200, True))
+# the UI's own API calls: /v1/chat/completions + the /v1-only stream/control routes
+for path in ("/v1/chat/completions", "/v1/chat/completions/control", "/v1/streams/lookup"):
+    j = jget(req("POST", path, LLAMA_TOKEN, body={})[2])
+    check(f"WebUI call POST {path} reaches llama intact", j.get("path"), path)
+
+# the stream the WebUI reads its tokens from (GET /v1/stream is SSE, /v1-only)
+t0, stamps = time.time(), []
+r = urllib.request.Request(f"http://127.0.0.1:{PUBLIC}/v1/stream?conv_id=1",
+                           headers={"Authorization": f"Bearer {LLAMA_TOKEN}",
+                                    "Accept": "text/event-stream"})
+with urllib.request.urlopen(r, timeout=20) as resp:
+    for line in resp:
+        if line.strip().startswith(b"data:"):
+            stamps.append(round(time.time() - t0, 2))
+check("GET /v1/stream streams (not 404'd by a stripped prefix)",
+      (len(stamps), resp.status, stamps[0] < 0.5, stamps[-1] > 0.6), (3, 200, True, True))
 
 # mcp-session-id pass-through
 code, _, body = req("DELETE", "/mcp", headers={"mcp-session-id": "sess-42"})
@@ -283,6 +326,31 @@ check("discovery at /_gateway, not /",
        "location = / {\n            default_type application/json" in conf), (True, False))
 check("no nested if in any auth gate", "; if (" in conf, False)
 check("token map uses one case-insensitive key", conf.count("~*^Bearer[[:space:]]+"), 3)
+check("llama /v1 is an identity mount (prefix kept, no rewrite)",
+      ("location ~ ^/v1(/.*)?$ {" in conf, "rewrite ^/v1" in conf), (True, False))
+check("public paths tolerate a query string",
+      conf.count("~*^(\\/health|\\/props)/?(\\?.*)?$ 1;") +
+      conf.count("~*^(\\/v1\\/models)/?(\\?.*)?$ 1;"), 2)
+
+# ------------------------------------------------- "the UI is missing" report
+# a llama-server with --no-ui answers 404 for / by itself: the gateway has to
+# say so instead of looking broken. No nginx needed -- it is an origin probe.
+no_ui = subprocess.Popen([sys.executable, os.path.join(HERE, "fake_llama_server.py"),
+                          str(NO_UI), "--no-ui"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+time.sleep(1)
+try:
+    from cellkit.gateway import origin_note
+    code, note = origin_note({"port": NO_UI, "routes": ["/"]})
+    check("origin probe: --no-ui llama explains itself",
+          (code, "no UI at /" in note), (404, True))
+    check("origin probe: a llama with a UI just reports 200",
+          origin_note({"port": LLAMA, "routes": ["/"]})[0], 200)
+    check("origin probe: a dead port is not a 404",
+          origin_note({"port": 8097, "routes": ["/"]})[0], 0)
+finally:
+    no_ui.kill()
 
 # ---------------------------------------------------------------- summary
 print("\n" + "=" * 60)

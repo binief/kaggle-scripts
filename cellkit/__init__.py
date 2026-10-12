@@ -14,11 +14,11 @@ health checks) happens inside. Extra handles: ck.status(), ck.stop().
 from .gateway import (DEFAULT_DIR, exact, find_nginx, http, llama, nginx, state, status,
                       stop_nginx, svc, webui)
 from .mcps import ensure_node, mcp, mcps, running, stop_mcps
-from .util import kill_port, port_open, pids_on_port, sh, wait_port
+from .util import http_probe, kill_port, port_open, pids_on_port, sh, wait_port
 
 __version__ = "0.1.0"
 __all__ = ["nginx", "mcps", "svc", "http", "exact", "webui", "llama", "mcp", "status",
-           "stop", "state", "running", "port_open", "kill_port", "wait_port",
+           "stop", "state", "running", "port_open", "http_probe", "kill_port", "wait_port",
            "ensure_node", "find_nginx", "DEFAULT_DIR", "__version__"]
 
 
