@@ -1,0 +1,2 @@
+# cellkit has no python dependencies.
+# System packages it may install for you: nginx (gateway), node 22 + mcp-proxy (MCP side).

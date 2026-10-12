@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellkit"
+version = "0.1.0"
+description = "One public port for llama-server's WebUI + /v1 and N MCP servers, from tiny notebook cells."
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/binief/kaggle-scripts"
+
+[tool.setuptools]
+packages = ["cellkit"]
