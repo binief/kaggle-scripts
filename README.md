@@ -132,6 +132,13 @@ Files land in `/kaggle/working/mcp_gateway/`: `nginx.conf`, `state.json`, `mcp_r
   (`[origin :8080/ 404 -> the backend has no UI at / …]`). `--no-ui`, a build without the embedded
   UI, `--api-prefix`, `503` while the model loads and "my llama cell never started" all look like
   a broken gateway from the outside; they are not, and `ck.status()` says which one it is.
+* If `ck.mcps()` says an MCP has no command/npx and skips it, rerun CELL A first. Older
+  `state.json` files omitted the provider/command/npx launch settings; the current version persists
+  them for CELL B. A started web-search server should report
+  `initialize=web-search-mcp 0.3.1`.
+* `/mcp` is a Streamable HTTP protocol endpoint, not a webpage. Opening it in a browser sends a
+  plain `GET`, not MCP's `POST initialize`; test it with an MCP client configured for Streamable
+  HTTP at `https://<tunnel>/mcp`.
 * `public_paths` are matched against the raw request URI, so a query string or a trailing slash
   is fine (`/v1/models?x=1` stays public) and only that exact path is.
 * Legacy SSE (`/sse` + origin-level `/messages`) can only belong to one MCP: `sse_compat=True`
@@ -144,7 +151,7 @@ python3 tests/run_tests.py
 ```
 
 Runs both cells for real — it installs/starts a real nginx, so it needs `nginx` on PATH — and
-drives everything through the one public port: **110 checks**. The fake `llama-server` answers from
+drives everything through the one public port: **113 checks**. The fake `llama-server` answers from
 llama.cpp's real route table (`tests/llama_routes.py`), so a mount that rewrites `/v1/...` onto
 paths llama does not serve *fails* here instead of being echoed back as "200 OK, looks fine".
 

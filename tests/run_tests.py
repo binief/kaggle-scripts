@@ -6,8 +6,9 @@ Drives the gateway exactly like a notebook would:
 
     MCPS = [ck.mcp(...), ck.mcp(...)]
     ck.nginx(port=8890, llama=8080, services=[...])
-    ck.mcps(MCPS)
+    ck.mcps()  # loads the same launch settings from CELL A's state
 """
+import importlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ LLAMA_TOKEN, MCP_TOKEN = "test-token-123", "mcpsecret"
 NODE = shutil.which("node") or "/usr/bin/node"
 
 import cellkit as ck  # noqa: E402
+from cellkit.gateway import _normalise  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -261,6 +263,15 @@ check("GET /_gateway lists every route",
               "/detokenize", "/mcp", "/mcp/fs", "/svc/echo", "/raw/echo"]))
 check("state.json has mcp entries + tokens",
       (len(st["mcp"]), st["tokens"].get("llama_api")), (2, LLAMA_TOKEN))
+check("state.json keeps CELL B launch commands",
+      sorted((s["name"], bool(s.get("command"))) for s in st["mcp"]),
+      [("filesystem", True), ("mock_mcp_stdio", True)])
+provider_entry = _normalise([ck.mcp("/mcp/provider-check", 8894, provider="websearch")])[0]
+check("normalisation retains the websearch provider for CELL B",
+      provider_entry.get("provider"), "websearch")
+check("routing-only service table excludes MCP launch settings",
+      any("command" in s or "env" in s for s in st["services"] if s["kind"] == "mcp"),
+      False)
 check("ck.status() reports the same table", ck.status()["public_port"], PUBLIC)
 
 # SSE must stream tick by tick, not buffered
@@ -274,11 +285,17 @@ check("SSE streams through nginx (3 events, not buffered)",
 print(f"         event arrival times: {stamps}")
 
 # ---------------------------------------------------------------- CELL B
-print("\n########## CELL B: ck.mcps(MCPS) ##########")
-# node 20 is what's in this sandbox; a Kaggle image gets node 22 downloaded
+print("\n########## CELL B: ck.mcps() ##########")
+# node 20 is what's in this sandbox; a Kaggle image gets node 22 downloaded.
+# Use the no-argument form here to exercise CELL B's readback of CELL A state.
 node_paths = {"node": NODE, "npm": shutil.which("npm"), "npx": shutil.which("npx")}
-ck.ensure_node = lambda **kw: node_paths          # noqa: ARG005  (test stub)
-run = ck.mcps(MCPS)
+mcp_module = importlib.import_module("cellkit.mcps")
+original_ensure_node = mcp_module.ensure_node
+mcp_module.ensure_node = lambda **kw: node_paths  # noqa: ARG005  (test stub)
+try:
+    run = ck.mcps()
+finally:
+    mcp_module.ensure_node = original_ensure_node
 
 print("\n--- full stack: nginx -> mcp-proxy -> stdio MCP ---")
 check("both MCPs reported running (name auto-derived from the command)",
