@@ -17,6 +17,8 @@ from .util import (http_probe, kill_port, port_open, regex_escape, resolve_token
 DEFAULT_DIR = "/kaggle/working/mcp_gateway"
 NGINX_CANDIDATES = ["nginx", "/usr/sbin/nginx", "/usr/local/sbin/nginx",
                     "/usr/local/nginx/sbin/nginx", "/opt/conda/bin/nginx", "/sbin/nginx"]
+MCP_LAUNCH_FIELDS = ("provider", "command", "npx", "args", "cwd", "env", "stateless",
+                     "proxy_args")
 
 
 # ---------------------------------------------------------------- service dicts
@@ -130,7 +132,7 @@ def _normalise(services):
             raise SystemExit(f"service {s.get('name')!r} has no routes")
         routes = [str(r) if str(r).startswith("/") else "/" + str(r) for r in s["routes"]]
         routes = [r.rstrip("/") or "/" for r in routes]
-        out.append({
+        entry = {
             "name": str(s.get("name") or routes[0].strip("/") or "root"),
             "routes": routes,
             "port": int(s["port"]),
@@ -142,7 +144,13 @@ def _normalise(services):
             "token": resolve_token(s.get("token")),
             "public_paths": [str(p) for p in (s.get("public_paths") or [])],
             "alias": "svc_" + re.sub(r"\W", "_", str(s.get("name") or "root")),
-        })
+        }
+        if entry["kind"] == "mcp":
+            # CELL B's ck.mcps() reads this state to launch the stdio process.
+            # Keep its launch settings out of the gateway-only service table,
+            # but retain them on the normalised entry for the `mcp` state list.
+            entry.update({key: s[key] for key in MCP_LAUNCH_FIELDS if key in s})
+        out.append(entry)
     out.sort(key=lambda e: max(len(r) for r in e["routes"]), reverse=True)  # /mcp/fs first
     return out
 
@@ -435,7 +443,10 @@ def nginx(port=8890, services=(), llama=None, token="auto", sse_compat=None,  # 
 
     state = {
         "public_port": port, "conf": conf_path, "updated": time.time(),
-        "services": entries,
+        "services": [
+            {key: value for key, value in e.items() if key not in MCP_LAUNCH_FIELDS}
+            for e in entries
+        ],
         "mcp": [{**e, "route": e["routes"][0]} for e in entries if e["kind"] == "mcp"],
         "tokens": {e["name"]: e["token"] for e in entries if e["token"]},
     }

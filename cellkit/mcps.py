@@ -137,7 +137,9 @@ def _spawn(cfg, node_paths, directory):
     if cfg.get("npx"):
         command = [node_paths["npx"], "-y", cfg["npx"], *cfg.get("args", [])]
     if not command:
-        print(f" -  {name}: no command/npx given, skipped")
+        print(f" -  {name}: no command/npx given, skipped "
+              "(if loaded with ck.mcps(), rerun CELL A with the current cellkit "
+              "to refresh state.json with the MCP launch settings)")
         return None
     command = [node_paths["node"] if c == "node" else node_paths["npx"] if c == "npx" else c
                for c in command]
